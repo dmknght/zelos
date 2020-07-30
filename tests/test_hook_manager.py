@@ -291,6 +291,21 @@ class HookManagerTest(unittest.TestCase):
         z.start()
         self.assertEqual(z.regs.getIP(), 0x8048B72)
 
+    def test_func_hook(self):
+        z = Zelos(path.join(DATA_DIR, "dynamic_elf_heap_overflow"))
+
+        malloc_addrs = []
+
+        def malloc_hook(zelos):
+            malloc_addrs.append(zelos.thread.getIP())
+
+        z.internal_engine.hook_manager.register_func_hook(
+            "malloc", malloc_hook
+        )
+        z.start()
+
+        self.assertEqual(malloc_addrs, [5616])
+
 
 def main():
     unittest.main()

@@ -107,6 +107,13 @@ class HookManager:
         # initialization has been completed.
         self._internal_mem_hooks_enabled = False
 
+        # In order to use function hooks, we need to know the base
+        # address of the target module. This is not immediately
+        # available for dynamic binaries. We will wait for the first
+        # time the target binary is mapped into memory.
+        self._func_hooks_enabled = False
+        self._func_hooks_to_register = []
+
     def register_mem_hook(
         self,
         hook_type: HookType.MEMORY,
@@ -286,6 +293,69 @@ class HookManager:
                 syscall_hook_type, syscall_callback_wrapper, name
             )
         return self._add_zelos_hook(syscall_hook_type, callback, name)
+
+    def attempt_to_setup_func_hooks(self):
+        """
+        Attempt to get the function base. If unsuccessful, place a
+        hook that waits for the module to be mapped.
+        """
+        base_address = self.z.memory.get_module_base(self.z.target_binary_path)
+        if base_address is not None:
+            self.logger.verbose("Setting up func hooks")
+            self._func_hooks_enabled = True
+            for (name, callback) in self._func_hooks_to_register:
+                self.register_func_hook(name, callback)
+            self._func_hooks_to_register = None
+            return
+        self.logger.verbose("Delaying func hook setup")
+
+        # Wait for the main module to be loaded before setting up the
+        # function hooks
+        def main_module_is_loaded():
+            base_address = self.z.memory.get_module_base(
+                self.z.target_binary_path
+            )
+            return base_address is not None
+
+        def delayed_func_hook_setup(zelos, access, address, size, data):
+            if main_module_is_loaded():
+                self.attempt_to_setup_func_hooks()
+
+        self.register_mem_hook(
+            HookType.MEMORY.INTERNAL_MAP,
+            delayed_func_hook_setup,
+            end_condition=main_module_is_loaded,
+        )
+
+    def register_func_hook(self, name: str, callback) -> HookInfo:
+        address_ptr = self.z.main_module._elf_dynamic_import_addrs.get(
+            name, None
+        )
+        if address_ptr is None:
+            self.logger.notice(f"Couldn't find function {name}")
+            return None
+
+        if not self._func_hooks_enabled:
+            self._func_hooks_to_register.append((name, callback))
+            return
+
+        address_ptr += self.z.memory.get_module_base(self.z.target_binary_path)
+
+        def read_wrapper(z, access, address, size, value):
+            callback(z)
+
+        # TODO: Another way to do this is to wait for these pointers
+        # to be written to, and then hook those execution locations.
+        # addr = self.z.memory.read_int(address_ptr)
+        # self.register_exec_hook(
+        #     HookType.EXEC.INST, callback, ip_low=addr, ip_high=addr
+        # )
+        self.register_mem_hook(
+            HookType.MEMORY.READ,
+            read_wrapper,
+            mem_low=address_ptr,
+            mem_high=address_ptr + 4,
+        )
 
     def register_exception_hook(self, callback, name=None) -> HookInfo:
         self.z.exception_handler.register_exception_handler(callback)
